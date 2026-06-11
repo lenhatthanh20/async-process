@@ -40,6 +40,6 @@ impl CommandExt for Command {
 
 impl AsRawHandle for Child {
     fn as_raw_handle(&self) -> RawHandle {
-        self.child.lock().unwrap().get_mut().as_raw_handle()
+        self.child.lock().unwrap().inner.as_raw_handle()
     }
 }

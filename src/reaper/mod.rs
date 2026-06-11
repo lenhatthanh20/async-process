@@ -154,6 +154,13 @@ impl Reaper {
         unreachable!()
     }
 
+    /// Register a child that was spawned outside of `std` into this reaper by its raw pid.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn adopt(&'static self, pid: rustix::process::Pid) -> ChildGuard {
+        let Self::Signal(this) = self;
+        ChildGuard::Signal(this.adopt(pid))
+    }
+
     /// Wait for the inner child to complete.
     pub(crate) async fn status(
         &'static self,
@@ -193,17 +200,60 @@ impl Reaper {
 }
 
 impl ChildGuard {
-    /// Get a reference to the inner process.
-    pub(crate) fn get_mut(&mut self) -> &mut std::process::Child {
+    /// Get the OS-assigned process identifier of the inner process.
+    pub(crate) fn id(&mut self) -> u32 {
         cfg_wait! {
             if let Self::Wait(this) = self {
-                return this.get_mut();
+                return this.get_mut().id();
             }
         }
 
         cfg_signal! {
             if let Self::Signal(this) = self {
-                return this.get_mut();
+                return this.id();
+            }
+        }
+
+        unreachable!()
+    }
+
+    /// Kill the inner process.
+    pub(crate) fn kill(&mut self) -> io::Result<()> {
+        cfg_wait! {
+            if let Self::Wait(this) = self {
+                return this.get_mut().kill();
+            }
+        }
+
+        cfg_signal! {
+            if let Self::Signal(this) = self {
+                return this.kill();
+            }
+        }
+
+        unreachable!()
+    }
+
+    /// Get the raw handle of the inner process.
+    #[cfg(windows)]
+    pub(crate) fn as_raw_handle(&mut self) -> std::os::windows::io::RawHandle {
+        use std::os::windows::io::AsRawHandle;
+
+        let Self::Wait(this) = self;
+        this.get_mut().as_raw_handle()
+    }
+
+    /// Check whether the inner process has exited.
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        cfg_wait! {
+            if let Self::Wait(this) = self {
+                return this.get_mut().try_wait();
+            }
+        }
+
+        cfg_signal! {
+            if let Self::Signal(this) = self {
+                return this.try_wait();
             }
         }
 

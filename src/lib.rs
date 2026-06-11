@@ -170,6 +170,13 @@ impl Reaper {
         self.ensure_driven();
         self.sys.register(child)
     }
+
+    /// Register a process spawned outside of `std` with this reaper.
+    #[cfg(target_os = "macos")]
+    fn adopt(&'static self, pid: rustix::process::Pid) -> reaper::ChildGuard {
+        self.ensure_driven();
+        self.sys.adopt(pid)
+    }
 }
 
 cfg_if::cfg_if! {
@@ -194,17 +201,11 @@ struct ChildGuard {
     reaper: &'static Reaper,
 }
 
-impl ChildGuard {
-    fn get_mut(&mut self) -> &mut std::process::Child {
-        self.inner.get_mut()
-    }
-}
-
 // When the last reference to the child process is dropped, push it into the zombie list.
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if self.kill_on_drop {
-            self.get_mut().kill().ok();
+            self.inner.kill().ok();
         }
         if self.reap_on_drop {
             self.inner.reap(&self.reaper.sys);
@@ -281,6 +282,51 @@ impl Child {
         })
     }
 
+    /// Adopts a process that was spawned by means other than [`Command`], registering it in the
+    /// global process list by its OS-assigned process identifier.
+    ///
+    /// The returned [`Child`] has no stdio handles; the caller is responsible for any pipes
+    /// connected to the process. If `reap_on_drop` is `true`, dropping the returned [`Child`]
+    /// hands the process to the reaper so that it does not become a zombie. If `kill_on_drop` is
+    /// `true`, dropping the returned [`Child`] also kills the process.
+    ///
+    /// # Safety
+    ///
+    /// - `pid` must identify a direct child of the calling process that has not yet been waited
+    ///   on.
+    /// - After this call, the process must not be waited on by any other means (such as `waitpid`
+    ///   or `std::process::Child::wait`), and no other [`Child`] may be created from the same
+    ///   `pid`. Otherwise, the pid may be reused by an unrelated process, which this handle could
+    ///   then kill or wait on.
+    #[cfg(target_os = "macos")]
+    pub unsafe fn adopt_raw_pid(
+        pid: u32,
+        reap_on_drop: bool,
+        kill_on_drop: bool,
+    ) -> io::Result<Child> {
+        let pid = i32::try_from(pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
+
+        let reaper = Reaper::get();
+        reaper.child_count.fetch_add(1, Ordering::Relaxed);
+        let inner = reaper.adopt(pid);
+
+        Ok(Child {
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            child: Arc::new(Mutex::new(ChildGuard {
+                inner,
+                reap_on_drop,
+                kill_on_drop,
+                reaper,
+            })),
+        })
+    }
+
     /// Returns the OS-assigned process identifier associated with this child.
     ///
     /// # Examples
@@ -294,7 +340,7 @@ impl Child {
     /// # std::io::Result::Ok(()) });
     /// ```
     pub fn id(&self) -> u32 {
-        self.child.lock().unwrap().get_mut().id()
+        self.child.lock().unwrap().inner.id()
     }
 
     /// Forces the child process to exit.
@@ -317,7 +363,7 @@ impl Child {
     /// # std::io::Result::Ok(()) });
     /// ```
     pub fn kill(&mut self) -> io::Result<()> {
-        self.child.lock().unwrap().get_mut().kill()
+        self.child.lock().unwrap().inner.kill()
     }
 
     /// Returns the exit status if the process has exited.
@@ -339,7 +385,7 @@ impl Child {
     /// # std::io::Result::Ok(()) });
     /// ```
     pub fn try_status(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.lock().unwrap().get_mut().try_wait()
+        self.child.lock().unwrap().inner.try_wait()
     }
 
     /// Drops the stdin handle and waits for the process to exit.
